@@ -16,7 +16,10 @@ enum DevSelfTest {
         closeAndReopen()
         blankNotesAreDiscarded()
         legacyEncodingIsKept()
-        log(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
+        // Some checks run on the next runloop turn (after deferred restyles); report once they're in.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            log(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
+        }
     }
 
     // MARK: Cases
