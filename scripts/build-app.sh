@@ -38,6 +38,7 @@ cp "$BIN_DIR/SidecarNote" "$EXE"
 HL="$APP/Contents/Resources/Highlightr.bundle"
 mkdir -p "$HL"
 cp Vendor/Highlightr/src/assets/highlighter/highlight.min.js Vendor/Highlightr/src/assets/styles/*.css "$HL/"
+cp Vendor/Highlightr/src/assets/highlighter/LICENSE "$HL/highlight.js-LICENSE"
 
 [[ -f Resources/AppIcon.icns ]] && cp Resources/AppIcon.icns "$APP/Contents/Resources/"
 
