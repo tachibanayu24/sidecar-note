@@ -33,13 +33,20 @@ private final class SourceMap {
     /// with the container's indent added to their columns, so inline ranges on those lines come out shifted.
     private var columnFixes: [Int: Int] = [:]
 
-    init(_ string: String) {
+    /// Lines the parser saw with extra characters appended (see `MarkdownStyler.parseSource`): positions there
+    /// are clamped to the line's real content.
+    private let extendedLines: Set<Int>
+
+    init(_ string: String, extendedLines: Set<Int> = []) {
         text = string as NSString
+        self.extendedLines = extendedLines
         var i = 0
         for unit in string.utf16 {
             i += 1
             if unit == 0x0A { lineStarts.append(i) }
         }
+        // The appended text is not in the source, so it can't calibrate those lines.
+        for line in extendedLines { columnFixes[line] = 0 }
     }
 
     private func lineRange(_ line: Int) -> NSRange {
@@ -96,8 +103,9 @@ private final class SourceMap {
         guard line >= 0, line < lineStarts.count else { return text.length }
         let range = lineRange(line)
         let byte = max(0, loc.column - 1 + (columnFixes[line] ?? 0))
-        guard let table = byteTable(line) else { return range.location + min(byte, range.length) }
-        return range.location + table[min(byte, table.count - 1)]
+        let limit = extendedLines.contains(line) ? text.withoutNewline(range).length : range.length
+        guard let table = byteTable(line) else { return range.location + min(byte, limit) }
+        return range.location + min(table[min(byte, table.count - 1)], limit)
     }
 
     func range(_ r: SourceRange?) -> NSRange? {
@@ -214,8 +222,9 @@ final class MarkdownStyler {
     func render(_ string: String) -> NSMutableAttributedString {
         let out = NSMutableAttributedString(string: string, attributes: baseAttributes)
         guard !string.isEmpty else { return out }
-        let document = Document(parsing: string)
-        let map = SourceMap(string)
+        let (source, extended) = MarkdownStyler.parseSource(string)
+        let document = Document(parsing: source)
+        let map = SourceMap(string, extendedLines: extended)
         map.calibrate(document)
         var ctx = Context(out: out, map: map)
         for line in ctx.lines(in: NSRange(location: 0, length: out.length))
@@ -225,6 +234,43 @@ final class MarkdownStyler {
         for child in document.children { block(child, &ctx, listDepth: 0) }
         styleAutolinks(out)
         return out
+    }
+
+    /// A line holding nothing but a list marker ("- ", "  1."), as left by Return / Tab in a list.
+    private static let emptyItem = try! NSRegularExpression(pattern: #"^[ \t]*(?:>[ \t]?)*[ \t]*(?:[-*+]|\d{1,9}[.)])[ \t]*$"#)
+    /// The number of an indented ordered item.
+    private static let nestedNumber = try! NSRegularExpression(pattern: #"^[ \t]*(?:>[ \t]?)*[ \t]+(\d{1,9})[.)](?:[ \t]|$)"#)
+
+    /// The text handed to the parser. CommonMark lets neither an empty item nor an ordered item numbered other
+    /// than 1 interrupt a paragraph, which is exactly what a note looks like while a list is being typed:
+    /// "- a\n  - " would make "a" a setext heading (the lone "-" as its underline) and "1. a\n   2. b" a single
+    /// paragraph. So the parser sees empty items with a placeholder body (appended; positions on those lines
+    /// are clamped back by `SourceMap`) and nested numbers as "01" (same length, still valued 1).
+    static func parseSource(_ string: String) -> (String, Set<Int>) {
+        let ns = string as NSString
+        var out = ""
+        var extended = Set<Int>()
+        var changed = false
+        for (i, line) in ns.lineRanges(in: NSRange(location: 0, length: ns.length)).enumerated() {
+            let content = ns.withoutNewline(line)
+            var text = ns.substring(with: content)
+            let whole = NSRange(location: 0, length: content.length)
+            if let m = nestedNumber.firstMatch(in: text, range: whole) {
+                let digits = m.range(at: 1)
+                text = (text as NSString).replacingCharacters(
+                    in: digits, with: String(repeating: "0", count: digits.length - 1) + "1")
+                changed = true
+            }
+            if emptyItem.firstMatch(in: text, range: whole) != nil {
+                // Trailing blanks dropped: five or more after the marker would make the body indented code.
+                while let last = text.last, last == " " || last == "\t" { text.removeLast() }
+                text += " x"
+                extended.insert(i)
+                changed = true
+            }
+            out += text + ns.substring(with: NSRange(location: NSMaxRange(content), length: NSMaxRange(line) - NSMaxRange(content)))
+        }
+        return (changed ? out : string, extended)
     }
 
     private struct Context {
@@ -380,17 +426,52 @@ final class MarkdownStyler {
         } else {
             out.addAttributes([.foregroundColor: NSColor.clear, .mdBullet: NSNumber(value: depth)], range: markerRange)
         }
-        setHangingIndent(out, line: firstLine, prefixEnd: prefixEnd)
+
+        // Nesting is drawn from the list depth, not the source's spaces: two spaces are far too narrow to read
+        // as a level, and items with different marker widths would otherwise sit at uneven offsets.
+        let indent = CGFloat(depth) * listIndentStep
+        collapseIndent(out, line: firstLine, before: markerStart)
+        let contentX = setHangingIndent(out, line: firstLine, prefixEnd: prefixEnd, indent: indent)
+        // The item's other lines (continuations, later paragraphs) line up with its text; nested items are
+        // styled after this and override their own lines.
+        for line in ctx.lines(in: range).dropFirst() {
+            let content = ctx.stripNewline(line)
+            guard content.length > 0, out.attribute(.mdQuote, at: content.location, effectiveRange: nil) == nil else { continue }
+            var textStart = content.location
+            while textStart < NSMaxRange(content), isBlank(ctx.text.character(at: textStart)) { textStart += 1 }
+            collapseIndent(out, line: content, before: textStart)
+            let p = (out.attribute(.paragraphStyle, at: content.location, effectiveRange: nil) as? NSParagraphStyle)?
+                .mutableCopy() as? NSMutableParagraphStyle ?? paragraphStyle()
+            p.firstLineHeadIndent = contentX
+            p.headIndent = contentX
+            out.addAttribute(.paragraphStyle, value: p, range: content)
+        }
     }
 
-    /// Wrapped lines align with the text after the list / quote marker.
-    private func setHangingIndent(_ out: NSMutableAttributedString, line: NSRange, prefixEnd: Int) {
-        guard prefixEnd > line.location else { return }
+    private var listIndentStep: CGFloat { round(size * 1.6) }
+
+    /// Shrinks the leading blanks of a list line to nothing; its paragraph indent places it instead.
+    /// Inside a quote the blank right after ">" is kept so items line up with the quote's other text.
+    private func collapseIndent(_ out: NSMutableAttributedString, line: NSRange, before end: Int) {
+        let text = out.mutableString
+        var start = end
+        while start > line.location, isBlank(text.character(at: start - 1)) { start -= 1 }
+        if start > line.location, text.character(at: start - 1) == 0x3E, start < end { start += 1 }
+        guard end > start else { return }
+        out.addAttributes([.font: hiddenFont, .foregroundColor: NSColor.clear], range: NSRange(location: start, length: end - start))
+    }
+
+    /// Wrapped lines align with the text after the list / quote marker. Returns that text's x offset.
+    @discardableResult
+    private func setHangingIndent(_ out: NSMutableAttributedString, line: NSRange, prefixEnd: Int, indent: CGFloat = 0) -> CGFloat {
+        guard prefixEnd > line.location else { return indent }
         let width = ceil(out.attributedSubstring(from: NSRange(location: line.location, length: prefixEnd - line.location)).size().width)
         let p = (out.attribute(.paragraphStyle, at: line.location, effectiveRange: nil) as? NSParagraphStyle)?
             .mutableCopy() as? NSMutableParagraphStyle ?? paragraphStyle()
-        p.headIndent = width
+        p.firstLineHeadIndent = indent
+        p.headIndent = indent + width
         out.addAttribute(.paragraphStyle, value: p, range: line)
+        return indent + width
     }
 
     private func codeParagraph(first: Bool = false, last: Bool = false, fence: Bool = false) -> NSMutableParagraphStyle {

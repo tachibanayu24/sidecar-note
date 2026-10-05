@@ -245,24 +245,29 @@ final class PanelController: NSObject, NSWindowDelegate {
             return
         }
         // Page-like transition: the new note glides in from the side of its tab, the old one drifts away.
+        // Only the x origin is animated: the size must keep following the host, which shrinks at the same time
+        // when the tab bar slides in with a second note (an animated frame would pin the old, taller size and
+        // push the first line up under the tab bar).
         let oldIndex = store.notes.firstIndex { $0.editor === old }
         let newIndex = store.notes.firstIndex { $0.id == note.id } ?? 0
         let forward = oldIndex.map { newIndex > $0 } ?? true
         let shift: CGFloat = forward ? 22 : -22
         let oldScroll = old.scrollView
-        let bounds = editorHost.bounds
-        scroll.frame = bounds.offsetBy(dx: shift, dy: 0)
+        scroll.setFrameOrigin(NSPoint(x: shift, y: 0))
         scroll.alphaValue = 0
         NSAnimationContext.runAnimationGroup({ ctx in
             ctx.duration = 0.34
             ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.9, 0.25, 1)
             ctx.allowsImplicitAnimation = true
-            scroll.animator().frame = bounds
+            scroll.animator().setFrameOrigin(.zero)
             scroll.animator().alphaValue = 1
-            oldScroll.animator().frame = bounds.offsetBy(dx: -shift * 0.6, dy: 0)
+            oldScroll.animator().setFrameOrigin(NSPoint(x: -shift * 0.6, y: 0))
             oldScroll.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            guard oldScroll !== self?.currentEditor?.scrollView else { return }
+            guard let self else { return }
+            // Settle on the host's final size whatever happened during the animation.
+            self.currentEditor?.scrollView.frame = self.editorHost.bounds
+            guard oldScroll !== self.currentEditor?.scrollView else { return }
             oldScroll.removeFromSuperview()
             oldScroll.alphaValue = 1
         })

@@ -306,8 +306,12 @@ final class MarkdownTextView: NSTextView {
     /// Rewrites every line of the selection with `transform` (nil = unchanged) as a single edit, then restores
     /// a selection shifted by what changed before / inside it.
     private func rewriteSelectedLines(_ transform: (String) -> String?) -> Bool {
+        rewriteLines(text.lineRanges(in: selectedRange()), transform)
+    }
+
+    /// `rewriteSelectedLines` over `lines`: the selected lines, possibly followed by more (an item's children).
+    private func rewriteLines(_ lines: [NSRange], _ transform: (String) -> String?) -> Bool {
         let sel = selectedRange()
-        let lines = text.lineRanges(in: sel)
         guard let first = lines.first, let last = lines.last else { return false }
         let block = NSRange(location: first.location, length: NSMaxRange(last) - first.location)
         var output = ""
@@ -322,7 +326,8 @@ final class MarkdownTextView: NSTextView {
             if rewritten != original { changed = true }
             let delta = (rewritten as NSString).length - (original as NSString).length
             if i == 0 { firstDelta = delta }
-            totalDelta += delta
+            // Lines past the selection's end don't move it.
+            if line.location < NSMaxRange(sel) || i == 0 { totalDelta += delta }
             output += rewritten + newline
         }
         guard changed else { return false }
@@ -355,10 +360,8 @@ final class MarkdownTextView: NSTextView {
 
         if rest.isEmpty {
             // Enter on an empty item: outdent, or end the list at top level.
-            if !indent.isEmpty {
-                let remove = indent.hasPrefix("\t") ? 1 : min(2, indent.count)
-                replace(NSRange(location: line.location, length: remove), with: "",
-                        select: NSRange(location: sel.location - remove, length: 0))
+            if !indent.isEmpty, group(m, "quote") == nil {
+                _ = indentListLines(outdent: true)
             } else {
                 replace(NSRange(location: line.location, length: m.range.length), with: "",
                         select: NSRange(location: line.location, length: 0))
@@ -386,16 +389,117 @@ final class MarkdownTextView: NSTextView {
         _ = indentListLines(outdent: true)
     }
 
-    /// Indents / outdents every list line in the selection. Returns false when there is nothing to do.
+    /// Indents / outdents the selected list items one level, children included. Tab nests an item under the
+    /// one above it (lined up with that item's text, which is what makes it a child in Markdown); ⇧Tab moves it
+    /// back to its parent's level. Returns false when the selection holds no list item.
     private func indentListLines(outdent: Bool) -> Bool {
         guard !inCodeBlock(at: selectedRange().location) else { return false }
-        return rewriteSelectedLines { line in
-            guard let m = listMatch(line), group(m, "quote") == nil else { return nil }
-            if !outdent { return "  " + line }
-            if line.hasPrefix("\t") { return String(line.dropFirst()) }
-            let spaces = min(2, line.prefix { $0 == " " }.count)
-            return spaces > 0 ? String(line.dropFirst(spaces)) : nil
+        let selected = text.lineRanges(in: selectedRange())
+        guard let first = selected.first(where: { isListItem(text.substring(with: text.withoutNewline($0))) }) else {
+            return false
         }
+        let firstText = text.substring(with: text.withoutNewline(first))
+        let base = indentWidth(firstText)
+        let target: Int
+        if outdent {
+            guard base > 0 else { return true }
+            target = parentItem(before: first.location, indent: base).map { indentWidth($0) } ?? max(0, base - 2)
+        } else {
+            // The first item of a list can't nest under anything.
+            guard let sibling = siblingItem(before: first.location, indent: base) else { return true }
+            target = contentColumn(sibling)
+        }
+        let delta = target - base
+        guard delta != 0 else { return true }
+
+        // The item's children (deeper lines right below the selection) move along with it.
+        var lines = Array(selected.drop { $0.location < first.location })
+        var next = NSMaxRange(lines.last!)
+        while next < text.length {
+            let line = text.lineRange(for: NSRange(location: next, length: 0))
+            let content = text.substring(with: text.withoutNewline(line))
+            guard !content.trimmingCharacters(in: .whitespaces).isEmpty, indentWidth(content) > base else { break }
+            lines.append(line)
+            next = NSMaxRange(line)
+        }
+        // A nested ordered item restarts at 1 (Markdown only nests "1." under text) or continues its new siblings.
+        let renumbered = renumber(firstText, newIndent: target, before: first.location)
+
+        var isFirst = true
+        return rewriteLines(lines) { line in
+            defer { isFirst = false }
+            let width = indentWidth(line)
+            guard isListItem(line) || width > base else { return nil }
+            let body = isFirst ? renumbered : line
+            return String(repeating: " ", count: max(0, width + delta)) + body.drop { $0 == " " || $0 == "\t" }
+        }
+    }
+
+    private func isListItem(_ line: String) -> Bool {
+        guard let m = listMatch(line) else { return false }
+        return group(m, "quote") == nil
+    }
+
+    /// Leading whitespace in columns (tabs stop every 4, as in CommonMark).
+    private func indentWidth(_ line: String) -> Int {
+        var width = 0
+        for c in line {
+            if c == " " { width += 1 } else if c == "\t" { width += 4 - width % 4 } else { break }
+        }
+        return width
+    }
+
+    /// Column where an item's text starts: its children must be indented at least this far.
+    private func contentColumn(_ item: String) -> Int {
+        guard let m = listMatch(item) else { return indentWidth(item) + 2 }
+        let end = group(m, "box")?.location ?? m.range.length
+        let prefix = (item as NSString).substring(to: end)
+        return indentWidth(prefix) + prefix.drop { $0 == " " || $0 == "\t" }.count
+    }
+
+    /// Walks up from `location` through the list above it, calling `visit` with each list item line until it
+    /// returns true or the list ends (a non-item line no deeper than `indent`).
+    private func itemsAbove(_ location: Int, indent: Int, _ visit: (String) -> Bool) -> String? {
+        var loc = location
+        while loc > 0 {
+            let line = text.lineRange(for: NSRange(location: loc - 1, length: 0))
+            loc = line.location
+            let content = text.substring(with: text.withoutNewline(line))
+            if content.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+            if isListItem(content) {
+                if visit(content) { return content }
+            } else if indentWidth(content) <= indent {
+                return nil
+            }
+        }
+        return nil
+    }
+
+    /// The item above at the same level (nothing shallower in between): Tab nests under it.
+    private func siblingItem(before location: Int, indent: Int) -> String? {
+        var found: String?
+        _ = itemsAbove(location, indent: indent) { item in
+            let w = indentWidth(item)
+            if w == indent { found = item }
+            return w <= indent
+        }
+        return found
+    }
+
+    /// The nearest item above that is shallower: ⇧Tab moves to its level.
+    private func parentItem(before location: Int, indent: Int) -> String? {
+        itemsAbove(location, indent: indent) { indentWidth($0) < indent }
+    }
+
+    /// `line` with its ordered-list number fitted to the level it is moving to.
+    private func renumber(_ line: String, newIndent: Int, before location: Int) -> String {
+        guard let m = listMatch(line), let num = group(m, "num") else { return line }
+        var number = 1
+        if let sibling = siblingItem(before: location, indent: newIndent), let sm = listMatch(sibling),
+           let snum = group(sm, "num") {
+            number = (Int((sibling as NSString).substring(with: snum)) ?? 0) + 1
+        }
+        return (line as NSString).replacingCharacters(in: num, with: String(number))
     }
 
     // MARK: Formatting commands

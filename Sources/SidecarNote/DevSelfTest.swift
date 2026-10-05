@@ -13,6 +13,7 @@ enum DevSelfTest {
         listEditing()
         tasks()
         sourceMapCalibration()
+        listRendering()
         closeAndReopen()
         blankNotesAreDiscarded()
         legacyEncodingIsKept()
@@ -68,13 +69,40 @@ enum DevSelfTest {
         tv.insertNewline(nil)
         check("Return on an empty item ends the list", editor.text == "- item\n")
 
-        let indent = EditorController(text: "- a\n- b", styler: styler())
-        indent.textView.setSelectedRange(NSRange(location: 0, length: 7))
+        let indent = EditorController(text: "- a\n- b\n- c", styler: styler())
+        indent.textView.setSelectedRange(NSRange(location: 4, length: 7))
         indent.textView.insertTab(nil)
-        check("Tab indents every selected list line", indent.text == "  - a\n  - b")
-        check("selection follows the indent", indent.textView.selectedRange() == NSRange(location: 2, length: 9))
+        check("Tab nests every selected item under the one above", indent.text == "- a\n  - b\n  - c")
+        check("selection follows the indent", indent.textView.selectedRange() == NSRange(location: 6, length: 9))
         indent.textView.insertBacktab(nil)
-        check("⇧Tab outdents", indent.text == "- a\n- b")
+        check("⇧Tab outdents", indent.text == "- a\n- b\n- c")
+
+        let firstItem = EditorController(text: "- a\n- b", styler: styler())
+        firstItem.textView.setSelectedRange(NSRange(location: 3, length: 0))
+        firstItem.textView.insertTab(nil)
+        check("the first item has nothing to nest under", firstItem.text == "- a\n- b")
+
+        let children = EditorController(text: "- a\n- b\n  - c\n- d", styler: styler())
+        children.textView.setSelectedRange(NSRange(location: 7, length: 0))
+        children.textView.insertTab(nil)
+        check("Tab takes the item's children along", children.text == "- a\n  - b\n    - c\n- d")
+        check("caret stays after the text", children.textView.selectedRange().location == 9)
+        children.textView.insertBacktab(nil)
+        check("⇧Tab brings them back", children.text == "- a\n- b\n  - c\n- d")
+
+        let numbered = EditorController(text: "1. a\n2. b", styler: styler())
+        numbered.textView.setSelectedRange(NSRange(location: 10, length: 0))
+        numbered.textView.insertTab(nil)
+        check("Tab nests a numbered item under the text and restarts at 1", numbered.text == "1. a\n   1. b")
+        numbered.textView.insertBacktab(nil)
+        check("⇧Tab continues the outer numbering", numbered.text == "1. a\n2. b")
+
+        let emptyNested = EditorController(text: "- a\n  - b", styler: styler())
+        emptyNested.textView.setSelectedRange(NSRange(location: 10, length: 0))
+        emptyNested.textView.insertNewline(nil)
+        check("Return continues a nested list", emptyNested.text == "- a\n  - b\n  - ")
+        emptyNested.textView.insertNewline(nil)
+        check("Return on an empty nested item outdents it", emptyNested.text == "- a\n  - b\n- ")
 
         let ordered = EditorController(text: "1. one", styler: styler())
         ordered.textView.setSelectedRange(NSRange(location: 6, length: 0))
@@ -126,6 +154,31 @@ enum DevSelfTest {
         let x = ("😀 **x**" as NSString).range(of: "x").location
         let emojiFont = emoji.attribute(.font, at: x, effectiveRange: nil) as? NSFont
         check("bold after an emoji (surrogate pair)", emojiFont?.fontDescriptor.symbolicTraits.contains(.bold) == true)
+    }
+
+    private static func listRendering() {
+        let s = styler()
+        func font(_ text: String, at index: Int) -> CGFloat {
+            (s.render(text).attribute(.font, at: index, effectiveRange: nil) as? NSFont)?.pointSize ?? 0
+        }
+        func indent(_ text: String, line: Int) -> CGFloat {
+            let ns = text as NSString
+            let start = ns.lineRanges(in: NSRange(location: 0, length: ns.length))[line].location
+            return (s.render(text).attribute(.paragraphStyle, at: start, effectiveRange: nil) as? NSParagraphStyle)?
+                .firstLineHeadIndent ?? -1
+        }
+        // "- a\n  - " in CommonMark is a setext heading "a"; while typing a list it must stay an item.
+        check("an empty nested item doesn't turn the line above into a heading", font("- a\n  - ", at: 2) == s.size)
+        check("nor does a lone marker under a paragraph", font("text\n- ", at: 0) == s.size)
+        check("a lone marker under a paragraph is a list item", s.render("text\n- ").attribute(.mdBullet, at: 5, effectiveRange: nil) != nil)
+        check("the empty nested item is drawn as a nested bullet", indent("- a\n  - ", line: 1) > 0)
+        check("a nested item numbered 2 still nests", indent("1. a\n   2. b", line: 1) > 0)
+        let one = indent("- a\n  - b\n    - c", line: 1), two = indent("- a\n  - b\n    - c", line: 2)
+        check("nesting is indented by a full step per level", one >= s.size * 1.4 && abs(two - one * 2) < 0.5)
+        check("top-level items aren't indented", indent("- a\n  - b", line: 0) == 0)
+        let wrapped = "- a\n  - b\n    more"
+        check("an item's continuation lines align with its text", indent(wrapped, line: 2) > indent(wrapped, line: 1))
+        check("setext headings still work", font("Title\n===", at: 0) > s.size)
     }
 
     private static func closeAndReopen() {
